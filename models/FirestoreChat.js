@@ -211,4 +211,3 @@ class FirestoreChat {
 }
 
 module.exports = new FirestoreChat();
-
