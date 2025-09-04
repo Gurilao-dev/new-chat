@@ -1,10 +1,11 @@
 const express = require('express');
-const { createClient } = require('@supabase/supabase-js');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
+const FirestoreChat = require('../models/FirestoreChat');
+const FirestoreUser = require('../models/FirestoreUser');
+const FirestoreMessage = require('../models/FirestoreMessage');
 
 const router = express.Router();
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // Middleware de autenticação
 router.use((req, res, next) => {
@@ -15,7 +16,7 @@ router.use((req, res, next) => {
   }
 
   try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'default_jwt_secret');
     req.user = decoded;
     next();
   } catch (error) {
@@ -23,141 +24,119 @@ router.use((req, res, next) => {
   }
 });
 
-// Criar ou buscar chat individual
+// Criar chat individual
 router.post('/individual', async (req, res) => {
   try {
     const { participantId } = req.body;
 
-    // Verificar se já existe chat entre os usuários
-    const { data: existingChat } = await supabase
-      .from('chat_participants')
-      .select(`
-        chat_id,
-        chats!inner(*)
-      `)
-      .eq('user_id', req.user.userId)
-      .eq('chats.type', 'individual');
+    // Verificar se já existe um chat entre os dois usuários
+    const existingChat = await FirestoreChat.findIndividualChat(req.user.userId, participantId);
 
-    if (existingChat.length > 0) {
-      for (const participant of existingChat) {
-        const { data: otherParticipant } = await supabase
-          .from('chat_participants')
-          .select('user_id')
-          .eq('chat_id', participant.chat_id)
-          .eq('user_id', participantId);
-
-        if (otherParticipant.length > 0) {
-          return res.json(participant.chats);
+    if (existingChat) {
+      // Buscar dados dos participantes
+      const participants = [];
+      for (const participant of existingChat.participants) {
+        const user = await FirestoreUser.findById(participant.user);
+        if (user) {
+          const { password, ...userWithoutPassword } = user;
+          participants.push({
+            user: userWithoutPassword,
+            role: participant.role,
+            joined_at: participant.joined_at
+          });
         }
       }
+
+      return res.json({
+        id: existingChat.id,
+        type: existingChat.type,
+        participants,
+        created_at: existingChat.created_at,
+        updated_at: existingChat.updated_at
+      });
     }
 
     // Criar novo chat
-    const chatId = uuidv4();
-    
-    const { data: newChat, error: chatError } = await supabase
-      .from('chats')
-      .insert([
-        {
-          id: chatId,
-          type: 'individual',
-          created_by: req.user.userId,
-          created_at: new Date().toISOString()
-        }
-      ])
-      .select()
-      .single();
+    const newChat = await FirestoreChat.create({
+      type: 'individual',
+      participants: [
+        { user: req.user.userId, role: 'member' },
+        { user: participantId, role: 'member' }
+      ]
+    });
 
-    if (chatError) {
-      return res.status(400).json({ error: chatError.message });
+    // Buscar dados dos participantes
+    const participants = [];
+    for (const participant of newChat.participants) {
+      const user = await FirestoreUser.findById(participant.user);
+      if (user) {
+        const { password, ...userWithoutPassword } = user;
+        participants.push({
+          user: userWithoutPassword,
+          role: participant.role,
+          joined_at: participant.joined_at
+        });
+      }
     }
 
-    // Adicionar participantes
-    const { error: participantsError } = await supabase
-      .from('chat_participants')
-      .insert([
-        {
-          chat_id: chatId,
-          user_id: req.user.userId,
-          joined_at: new Date().toISOString()
-        },
-        {
-          chat_id: chatId,
-          user_id: participantId,
-          joined_at: new Date().toISOString()
-        }
-      ]);
-
-    if (participantsError) {
-      return res.status(400).json({ error: participantsError.message });
-    }
-
-    res.status(201).json(newChat);
-
+    res.status(201).json({
+      id: newChat.id,
+      type: newChat.type,
+      participants,
+      created_at: newChat.created_at,
+      updated_at: newChat.updated_at
+    });
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao criar chat' });
+    console.error('Erro ao criar chat individual:', error);
+    res.status(500).json({ error: 'Erro ao criar chat individual' });
   }
 });
 
-// Criar grupo
+// Criar chat em grupo
 router.post('/group', async (req, res) => {
   try {
     const { name, description, avatar, participantIds } = req.body;
 
-    const chatId = uuidv4();
-
-    // Criar chat de grupo
-    const { data: newChat, error: chatError } = await supabase
-      .from('chats')
-      .insert([
-        {
-          id: chatId,
-          type: 'group',
-          name,
-          description,
-          avatar,
-          created_by: req.user.userId,
-          created_at: new Date().toISOString()
-        }
-      ])
-      .select()
-      .single();
-
-    if (chatError) {
-      return res.status(400).json({ error: chatError.message });
-    }
-
-    // Adicionar criador como administrador
+    // Adicionar o criador como admin
     const participants = [
-      {
-        chat_id: chatId,
-        user_id: req.user.userId,
-        role: 'admin',
-        joined_at: new Date().toISOString()
-      }
+      { user: req.user.userId, role: 'admin' },
+      ...participantIds.map(id => ({ user: id, role: 'member' }))
     ];
 
-    // Adicionar outros participantes
-    participantIds.forEach(participantId => {
-      participants.push({
-        chat_id: chatId,
-        user_id: participantId,
-        role: 'member',
-        joined_at: new Date().toISOString()
-      });
+    const newChat = await FirestoreChat.create({
+      name,
+      description,
+      type: 'group',
+      participants,
+      avatar
     });
 
-    const { error: participantsError } = await supabase
-      .from('chat_participants')
-      .insert(participants);
-
-    if (participantsError) {
-      return res.status(400).json({ error: participantsError.message });
+    // Buscar dados dos participantes
+    const participantsWithData = [];
+    for (const participant of newChat.participants) {
+      const user = await FirestoreUser.findById(participant.user);
+      if (user) {
+        const { password, ...userWithoutPassword } = user;
+        participantsWithData.push({
+          user: userWithoutPassword,
+          role: participant.role,
+          joined_at: participant.joined_at
+        });
+      }
     }
 
-    res.status(201).json(newChat);
-
+    res.status(201).json({
+      id: newChat.id,
+      name: newChat.name,
+      description: newChat.description,
+      type: newChat.type,
+      avatar: newChat.avatar,
+      participants: participantsWithData,
+      created_at: newChat.created_at,
+      updated_at: newChat.updated_at
+    });
   } catch (error) {
+    console.error('Erro ao criar grupo:', error);
     res.status(500).json({ error: 'Erro ao criar grupo' });
   }
 });
@@ -165,141 +144,102 @@ router.post('/group', async (req, res) => {
 // Listar chats do usuário
 router.get('/', async (req, res) => {
   try {
-    const { data: userChats, error } = await supabase
-      .from('chat_participants')
-      .select(`
-        chat_id,
-        role,
-        joined_at,
-        chats!inner(
-          id,
-          type,
-          name,
-          description,
-          avatar,
-          created_by,
-          created_at,
-          last_message_at
-        )
-      `)
-      .eq('user_id', req.user.userId)
-      .order('chats(last_message_at)', { ascending: false });
+    const chats = await FirestoreChat.findByUser(req.user.userId);
 
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
+    const formattedChats = [];
 
-    // Para chats individuais, buscar informações do outro participante
-    const chats = [];
-    
-    for (const userChat of userChats) {
-      const chat = userChat.chats;
-      
-      if (chat.type === 'individual') {
-        // Buscar o outro participante
-        const { data: otherParticipant } = await supabase
-          .from('chat_participants')
-          .select(`
-            users!inner(
-              id,
-              name,
-              virtual_number,
-              avatar,
-              status,
-              is_online,
-              last_seen
-            )
-          `)
-          .eq('chat_id', chat.id)
-          .neq('user_id', req.user.userId)
-          .single();
-
-        if (otherParticipant) {
-          chat.participant = otherParticipant.users;
+    for (const chat of chats) {
+      // Buscar dados dos participantes
+      const participants = [];
+      for (const participant of chat.participants) {
+        const user = await FirestoreUser.findById(participant.user);
+        if (user) {
+          const { password, ...userWithoutPassword } = user;
+          participants.push({
+            user: userWithoutPassword,
+            role: participant.role,
+            joined_at: participant.joined_at
+          });
         }
-      } else if (chat.type === 'group') {
-        // Para grupos, buscar número de participantes
-        const { data: participantsCount } = await supabase
-          .from('chat_participants')
-          .select('user_id', { count: 'exact' })
-          .eq('chat_id', chat.id);
-
-        chat.participants_count = participantsCount?.length || 0;
       }
 
-      // Buscar última mensagem
-      const { data: lastMessage } = await supabase
-        .from('messages')
-        .select('content, message_type, sent_at, sender_id')
-        .eq('chat_id', chat.id)
-        .order('sent_at', { ascending: false })
-        .limit(1)
-        .single();
+      // Buscar última mensagem se existir
+      let lastMessage = null;
+      if (chat.last_message) {
+        lastMessage = await FirestoreMessage.findById(chat.last_message);
+      }
 
-      chat.last_message = lastMessage;
-      chats.push({ ...userChat, chats: chat });
+      formattedChats.push({
+        id: chat.id,
+        name: chat.name,
+        description: chat.description,
+        type: chat.type,
+        avatar: chat.avatar,
+        participants,
+        last_message: lastMessage,
+        created_at: chat.created_at,
+        updated_at: chat.updated_at
+      });
     }
 
-    res.json(chats);
-
+    res.json(formattedChats);
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao buscar chats' });
+    console.error('Erro ao listar chats:', error);
+    res.status(500).json({ error: 'Erro ao listar chats' });
   }
 });
 
-// Buscar detalhes do chat
+// Obter detalhes de um chat
 router.get('/:chatId', async (req, res) => {
   try {
     const { chatId } = req.params;
 
-    // Verificar se usuário faz parte do chat
-    const { data: participation } = await supabase
-      .from('chat_participants')
-      .select('role')
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.userId)
-      .single();
+    const chat = await FirestoreChat.findById(chatId);
 
-    if (!participation) {
-      return res.status(403).json({ error: 'Você não tem acesso a este chat' });
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat não encontrado' });
     }
 
-    // Buscar detalhes do chat
-    const { data: chat, error } = await supabase
-      .from('chats')
-      .select('*')
-      .eq('id', chatId)
-      .single();
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
+    // Verificar se o usuário é participante
+    const isParticipant = chat.participants.some(p => p.user === req.user.userId);
+    if (!isParticipant) {
+      return res.status(403).json({ error: 'Acesso negado' });
     }
 
-    // Buscar participantes
-    const { data: participants } = await supabase
-      .from('chat_participants')
-      .select(`
-        role,
-        joined_at,
-        users!inner(
-          id,
-          name,
-          virtual_number,
-          avatar,
-          status,
-          is_online,
-          last_seen
-        )
-      `)
-      .eq('chat_id', chatId);
+    // Buscar dados dos participantes
+    const participants = [];
+    for (const participant of chat.participants) {
+      const user = await FirestoreUser.findById(participant.user);
+      if (user) {
+        const { password, ...userWithoutPassword } = user;
+        participants.push({
+          user: userWithoutPassword,
+          role: participant.role,
+          joined_at: participant.joined_at
+        });
+      }
+    }
 
-    chat.participants = participants;
-    chat.user_role = participation.role;
+    // Buscar última mensagem se existir
+    let lastMessage = null;
+    if (chat.last_message) {
+      lastMessage = await FirestoreMessage.findById(chat.last_message);
+    }
 
-    res.json(chat);
-
+    res.json({
+      id: chat.id,
+      name: chat.name,
+      description: chat.description,
+      type: chat.type,
+      avatar: chat.avatar,
+      participants,
+      last_message: lastMessage,
+      created_at: chat.created_at,
+      updated_at: chat.updated_at
+    });
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao buscar chat' });
+    console.error('Erro ao obter chat:', error);
+    res.status(500).json({ error: 'Erro ao obter chat' });
   }
 });
 
@@ -309,39 +249,27 @@ router.post('/:chatId/participants', async (req, res) => {
     const { chatId } = req.params;
     const { participantId } = req.body;
 
-    // Verificar se usuário é admin do grupo
-    const { data: participation } = await supabase
-      .from('chat_participants')
-      .select('role')
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.userId)
-      .single();
+    const chat = await FirestoreChat.findById(chatId);
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat não encontrado' });
+    }
 
-    if (!participation || participation.role !== 'admin') {
+    if (chat.type !== 'group') {
+      return res.status(400).json({ error: 'Só é possível adicionar participantes em grupos' });
+    }
+
+    // Verificar se o usuário é admin
+    const userParticipant = chat.participants.find(p => p.user === req.user.userId);
+    if (!userParticipant || userParticipant.role !== 'admin') {
       return res.status(403).json({ error: 'Apenas administradores podem adicionar participantes' });
     }
 
     // Adicionar participante
-    const { data: newParticipant, error } = await supabase
-      .from('chat_participants')
-      .insert([
-        {
-          chat_id: chatId,
-          user_id: participantId,
-          role: 'member',
-          joined_at: new Date().toISOString()
-        }
-      ])
-      .select()
-      .single();
+    await FirestoreChat.addParticipant(chatId, participantId, 'member');
 
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
-
-    res.status(201).json(newParticipant);
-
+    res.json({ message: 'Participante adicionado com sucesso' });
   } catch (error) {
+    console.error('Erro ao adicionar participante:', error);
     res.status(500).json({ error: 'Erro ao adicionar participante' });
   }
 });
@@ -351,32 +279,27 @@ router.delete('/:chatId/participants/:participantId', async (req, res) => {
   try {
     const { chatId, participantId } = req.params;
 
-    // Verificar se usuário é admin do grupo
-    const { data: participation } = await supabase
-      .from('chat_participants')
-      .select('role')
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.userId)
-      .single();
+    const chat = await FirestoreChat.findById(chatId);
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat não encontrado' });
+    }
 
-    if (!participation || participation.role !== 'admin') {
+    if (chat.type !== 'group') {
+      return res.status(400).json({ error: 'Só é possível remover participantes de grupos' });
+    }
+
+    // Verificar se o usuário é admin
+    const userParticipant = chat.participants.find(p => p.user === req.user.userId);
+    if (!userParticipant || userParticipant.role !== 'admin') {
       return res.status(403).json({ error: 'Apenas administradores podem remover participantes' });
     }
 
     // Remover participante
-    const { error } = await supabase
-      .from('chat_participants')
-      .delete()
-      .eq('chat_id', chatId)
-      .eq('user_id', participantId);
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
-    }
+    await FirestoreChat.removeParticipant(chatId, participantId);
 
     res.json({ message: 'Participante removido com sucesso' });
-
   } catch (error) {
+    console.error('Erro ao remover participante:', error);
     res.status(500).json({ error: 'Erro ao remover participante' });
   }
 });
@@ -386,21 +309,65 @@ router.post('/:chatId/leave', async (req, res) => {
   try {
     const { chatId } = req.params;
 
-    const { error } = await supabase
-      .from('chat_participants')
-      .delete()
-      .eq('chat_id', chatId)
-      .eq('user_id', req.user.userId);
-
-    if (error) {
-      return res.status(400).json({ error: error.message });
+    const chat = await FirestoreChat.findById(chatId);
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat não encontrado' });
     }
 
-    res.json({ message: 'Você saiu do grupo com sucesso' });
+    if (chat.type !== 'group') {
+      return res.status(400).json({ error: 'Só é possível sair de grupos' });
+    }
 
+    // Remover usuário dos participantes
+    await FirestoreChat.removeParticipant(chatId, req.user.userId);
+
+    res.json({ message: 'Você saiu do grupo' });
   } catch (error) {
+    console.error('Erro ao sair do grupo:', error);
     res.status(500).json({ error: 'Erro ao sair do grupo' });
   }
 });
 
+// Atualizar informações do grupo
+router.put('/:chatId', async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const { name, description, avatar } = req.body;
+
+    const chat = await FirestoreChat.findById(chatId);
+    if (!chat) {
+      return res.status(404).json({ error: 'Chat não encontrado' });
+    }
+
+    if (chat.type !== 'group') {
+      return res.status(400).json({ error: 'Só é possível atualizar informações de grupos' });
+    }
+
+    // Verificar se o usuário é admin
+    const userParticipant = chat.participants.find(p => p.user === req.user.userId);
+    if (!userParticipant || userParticipant.role !== 'admin') {
+      return res.status(403).json({ error: 'Apenas administradores podem atualizar informações do grupo' });
+    }
+
+    // Atualizar chat
+    const updatedChat = await FirestoreChat.update(chatId, {
+      name,
+      description,
+      avatar
+    });
+
+    res.json({
+      id: updatedChat.id,
+      name: updatedChat.name,
+      description: updatedChat.description,
+      avatar: updatedChat.avatar,
+      updated_at: updatedChat.updated_at
+    });
+  } catch (error) {
+    console.error('Erro ao atualizar grupo:', error);
+    res.status(500).json({ error: 'Erro ao atualizar grupo' });
+  }
+});
+
 module.exports = router;
+

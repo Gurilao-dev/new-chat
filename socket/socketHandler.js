@@ -1,6 +1,9 @@
 const jwt = require('jsonwebtoken');
+const FirestoreUser = require('../models/FirestoreUser');
+const FirestoreChat = require('../models/FirestoreChat');
+const FirestoreMessage = require('../models/FirestoreMessage');
 
-module.exports = (io, supabase) => {
+module.exports = (io) => {
   // Middleware de autenticação para Socket.io
   io.use(async (socket, next) => {
     try {
@@ -9,21 +12,23 @@ module.exports = (io, supabase) => {
         return next(new Error('Token de acesso requerido'));
       }
 
-      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      const decoded = jwt.verify(token, process.env.JWT_SECRET || 'default_jwt_secret');
       
       // Buscar dados do usuário
-      const { data: user } = await supabase
-        .from('users')
-        .select('id, name, virtual_number, avatar, status')
-        .eq('id', decoded.userId)
-        .single();
+      const user = await FirestoreUser.findById(decoded.userId);
 
       if (!user) {
         return next(new Error('Usuário não encontrado'));
       }
 
       socket.userId = user.id;
-      socket.user = user;
+      socket.user = {
+        id: user.id,
+        name: user.name,
+        virtual_number: user.virtual_number,
+        avatar: user.avatar,
+        status: user.status
+      };
       next();
     } catch (error) {
       next(new Error('Token inválido'));
@@ -31,199 +36,377 @@ module.exports = (io, supabase) => {
   });
 
   io.on('connection', async (socket) => {
-    console.log(`👤 Usuário conectado: ${socket.user.name}`);
+    console.log(`👤 Usuário conectado: ${socket.user.name} (${socket.userId})`);
 
     // Atualizar status online
-    await supabase
-      .from('users')
-      .update({ 
-        is_online: true, 
-        last_seen: new Date().toISOString() 
-      })
-      .eq('id', socket.userId);
+    try {
+      await FirestoreUser.updateOnlineStatus(socket.userId, true);
 
-    // Entrar nos chats do usuário
-    const { data: userChats } = await supabase
-      .from('chat_participants')
-      .select('chat_id')
-      .eq('user_id', socket.userId);
+      // Notificar contatos sobre status online
+      socket.broadcast.emit('user-online', {
+        userId: socket.userId,
+        user: socket.user
+      });
+    } catch (error) {
+      console.error('Erro ao atualizar status online:', error);
+    }
 
-    userChats?.forEach(chat => {
-      socket.join(chat.chat_id);
-    });
+    // Entrar nas salas dos chats do usuário
+    try {
+      const userChats = await FirestoreChat.findByUser(socket.userId);
 
-    // Notificar contatos que usuário ficou online
-    socket.broadcast.emit('user-online', {
-      userId: socket.userId,
-      user: socket.user
-    });
+      userChats.forEach(chat => {
+        socket.join(chat.id);
+      });
+    } catch (error) {
+      console.error('Erro ao entrar nas salas:', error);
+    }
 
-    // Eventos de mensagem
+    // Enviar mensagem
     socket.on('send-message', async (data) => {
       try {
-        const { chatId, content, messageType = 'text', replyToId = null } = data;
+        const { 
+          chatId, 
+          content, 
+          messageType = 'text', 
+          replyToId = null,
+          isForwarded = false,
+          forwardedFrom = null
+        } = data;
 
-        // Verificar participação no chat
-        const { data: participation } = await supabase
-          .from('chat_participants')
-          .select('id')
-          .eq('chat_id', chatId)
-          .eq('user_id', socket.userId)
-          .single();
-
-        if (!participation) {
-          socket.emit('error', { message: 'Você não tem acesso a este chat' });
+        // Verificar se o chat existe e o usuário é participante
+        const chat = await FirestoreChat.findById(chatId);
+        if (!chat) {
+          socket.emit('error', { message: 'Chat não encontrado' });
           return;
         }
 
-        const messageId = require('uuid').v4();
-
-        // Salvar mensagem no banco
-        const { data: newMessage, error } = await supabase
-          .from('messages')
-          .insert([
-            {
-              id: messageId,
-              chat_id: chatId,
-              sender_id: socket.userId,
-              content,
-              message_type: messageType,
-              reply_to_id: replyToId,
-              sent_at: new Date().toISOString()
-            }
-          ])
-          .select(`
-            *,
-            sender:users!messages_sender_id_fkey(
-              id,
-              name,
-              avatar
-            ),
-            reply_to:messages!messages_reply_to_id_fkey(
-              id,
-              content,
-              message_type,
-              sender:users!messages_sender_id_fkey(name)
-            )
-          `)
-          .single();
-
-        if (error) {
-          socket.emit('error', { message: 'Erro ao enviar mensagem' });
+        const isParticipant = chat.participants.some(p => p.user === socket.userId);
+        if (!isParticipant) {
+          socket.emit('error', { message: 'Você não é participante deste chat' });
           return;
         }
+
+        // Criar mensagem
+        const newMessage = await FirestoreMessage.create({
+          chat: chatId,
+          sender: socket.userId,
+          content,
+          message_type: messageType,
+          reply_to: replyToId,
+          is_forwarded: isForwarded,
+          forwarded_from: forwardedFrom
+        });
 
         // Atualizar última mensagem do chat
-        await supabase
-          .from('chats')
-          .update({ last_message_at: new Date().toISOString() })
-          .eq('id', chatId);
+        await FirestoreChat.updateLastMessage(chatId, newMessage.id);
 
-        // Emitir mensagem para todos no chat
-        io.to(chatId).emit('new-message', newMessage);
+        // Buscar dados do remetente
+        const sender = await FirestoreUser.findById(socket.userId);
+        const { password, ...senderWithoutPassword } = sender;
+
+        // Buscar mensagem de resposta se existir
+        let replyToMessage = null;
+        if (replyToId) {
+          replyToMessage = await FirestoreMessage.findById(replyToId);
+        }
+
+        const formattedMessage = {
+          id: newMessage.id,
+          chat_id: newMessage.chat,
+          sender: senderWithoutPassword,
+          content: newMessage.content,
+          message_type: newMessage.message_type,
+          reply_to: replyToMessage,
+          reactions: newMessage.reactions,
+          is_starred: newMessage.is_starred,
+          is_forwarded: newMessage.is_forwarded,
+          forwarded_from: newMessage.forwarded_from,
+          read_by: newMessage.read_by,
+          delivered_to: newMessage.delivered_to,
+          is_deleted: newMessage.is_deleted,
+          status: newMessage.status,
+          created_at: newMessage.created_at,
+          updated_at: newMessage.updated_at
+        };
+
+        // Enviar mensagem para todos os participantes do chat
+        io.to(chatId).emit('new-message', formattedMessage);
+
+        // Marcar como entregue para outros participantes
+        const otherParticipants = chat.participants.filter(p => p.user !== socket.userId);
+        for (const participant of otherParticipants) {
+          await FirestoreMessage.markAsDelivered(newMessage.id, participant.user);
+        }
 
       } catch (error) {
-        socket.emit('error', { message: 'Erro ao processar mensagem' });
+        console.error('Erro ao enviar mensagem:', error);
+        socket.emit('error', { message: 'Erro ao enviar mensagem' });
       }
     });
 
-    // Digitando
+    // Indicador de digitação
     socket.on('typing', (data) => {
-      socket.to(data.chatId).emit('user-typing', {
+      const { chatId } = data;
+      socket.to(chatId).emit('user-typing', {
+        chatId,
         userId: socket.userId,
-        userName: socket.user.name,
-        chatId: data.chatId
+        userName: socket.user.name
       });
     });
 
     socket.on('stop-typing', (data) => {
-      socket.to(data.chatId).emit('user-stop-typing', {
-        userId: socket.userId,
-        chatId: data.chatId
+      const { chatId } = data;
+      socket.to(chatId).emit('user-stop-typing', {
+        chatId,
+        userId: socket.userId
       });
+    });
+
+    // Marcar mensagem como lida
+    socket.on('mark-as-read', async (data) => {
+      try {
+        const { messageId } = data;
+
+        const message = await FirestoreMessage.findById(messageId);
+        if (!message) {
+          socket.emit('error', { message: 'Mensagem não encontrada' });
+          return;
+        }
+
+        // Verificar se o usuário é participante do chat
+        const chat = await FirestoreChat.findById(message.chat);
+        const isParticipant = chat.participants.some(p => p.user === socket.userId);
+        if (!isParticipant) {
+          socket.emit('error', { message: 'Você não é participante deste chat' });
+          return;
+        }
+
+        // Marcar como lida
+        await FirestoreMessage.markAsRead(messageId, socket.userId);
+
+        // Notificar outros participantes
+        socket.to(message.chat).emit('message-read', {
+          messageId,
+          userId: socket.userId,
+          readAt: new Date()
+        });
+
+      } catch (error) {
+        console.error('Erro ao marcar mensagem como lida:', error);
+        socket.emit('error', { message: 'Erro ao marcar mensagem como lida' });
+      }
+    });
+
+    // Adicionar reação
+    socket.on('add-reaction', async (data) => {
+      try {
+        const { messageId, emoji } = data;
+
+        const message = await FirestoreMessage.findById(messageId);
+        if (!message) {
+          socket.emit('error', { message: 'Mensagem não encontrada' });
+          return;
+        }
+
+        // Verificar se o usuário é participante do chat
+        const chat = await FirestoreChat.findById(message.chat);
+        const isParticipant = chat.participants.some(p => p.user === socket.userId);
+        if (!isParticipant) {
+          socket.emit('error', { message: 'Você não é participante deste chat' });
+          return;
+        }
+
+        // Adicionar reação
+        await FirestoreMessage.addReaction(messageId, socket.userId, emoji);
+
+        // Notificar outros participantes
+        io.to(message.chat).emit('reaction-added', {
+          messageId,
+          userId: socket.userId,
+          emoji,
+          userName: socket.user.name
+        });
+
+      } catch (error) {
+        console.error('Erro ao adicionar reação:', error);
+        socket.emit('error', { message: 'Erro ao adicionar reação' });
+      }
+    });
+
+    // Remover reação
+    socket.on('remove-reaction', async (data) => {
+      try {
+        const { messageId } = data;
+
+        const message = await FirestoreMessage.findById(messageId);
+        if (!message) {
+          socket.emit('error', { message: 'Mensagem não encontrada' });
+          return;
+        }
+
+        // Verificar se o usuário é participante do chat
+        const chat = await FirestoreChat.findById(message.chat);
+        const isParticipant = chat.participants.some(p => p.user === socket.userId);
+        if (!isParticipant) {
+          socket.emit('error', { message: 'Você não é participante deste chat' });
+          return;
+        }
+
+        // Remover reação
+        await FirestoreMessage.removeReaction(messageId, socket.userId);
+
+        // Notificar outros participantes
+        io.to(message.chat).emit('reaction-removed', {
+          messageId,
+          userId: socket.userId
+        });
+
+      } catch (error) {
+        console.error('Erro ao remover reação:', error);
+        socket.emit('error', { message: 'Erro ao remover reação' });
+      }
+    });
+
+    // Editar mensagem
+    socket.on('edit-message', async (data) => {
+      try {
+        const { messageId, newContent } = data;
+
+        const message = await FirestoreMessage.findById(messageId);
+        if (!message) {
+          socket.emit('error', { message: 'Mensagem não encontrada' });
+          return;
+        }
+
+        // Editar mensagem
+        const updatedMessage = await FirestoreMessage.edit(messageId, newContent, socket.userId);
+
+        // Notificar outros participantes
+        io.to(message.chat).emit('message-edited', {
+          messageId,
+          newContent,
+          isEdited: true,
+          editedAt: new Date()
+        });
+
+      } catch (error) {
+        console.error('Erro ao editar mensagem:', error);
+        socket.emit('error', { message: error.message });
+      }
+    });
+
+    // Deletar mensagem
+    socket.on('delete-message', async (data) => {
+      try {
+        const { messageId, deleteForEveryone = false } = data;
+
+        const message = await FirestoreMessage.findById(messageId);
+        if (!message) {
+          socket.emit('error', { message: 'Mensagem não encontrada' });
+          return;
+        }
+
+        // Deletar mensagem
+        await FirestoreMessage.delete(messageId, socket.userId, deleteForEveryone);
+
+        if (deleteForEveryone) {
+          // Notificar todos os participantes
+          io.to(message.chat).emit('message-deleted-for-everyone', {
+            messageId
+          });
+        } else {
+          // Notificar apenas o usuário
+          socket.emit('message-deleted-for-me', {
+            messageId
+          });
+        }
+
+      } catch (error) {
+        console.error('Erro ao deletar mensagem:', error);
+        socket.emit('error', { message: error.message });
+      }
     });
 
     // Chamadas WebRTC
     socket.on('call-user', (data) => {
-      socket.to(data.chatId).emit('incoming-call', {
-        from: socket.userId,
-        fromUser: socket.user,
-        callType: data.callType,
-        chatId: data.chatId,
-        offer: data.offer
+      const { chatId, callType, offer } = data;
+      socket.to(chatId).emit('incoming-call', {
+        chatId,
+        callType,
+        offer,
+        caller: socket.user
       });
     });
 
     socket.on('accept-call', (data) => {
-      socket.to(data.chatId).emit('call-accepted', {
-        from: socket.userId,
-        answer: data.answer
+      const { chatId, answer } = data;
+      socket.to(chatId).emit('call-accepted', {
+        chatId,
+        answer,
+        accepter: socket.user
       });
     });
 
     socket.on('reject-call', (data) => {
-      socket.to(data.chatId).emit('call-rejected', {
-        from: socket.userId
-      });
-    });
-
-    socket.on('ice-candidate', (data) => {
-      socket.to(data.chatId).emit('ice-candidate', {
-        from: socket.userId,
-        candidate: data.candidate
+      const { chatId } = data;
+      socket.to(chatId).emit('call-rejected', {
+        chatId,
+        rejector: socket.user
       });
     });
 
     socket.on('end-call', (data) => {
-      socket.to(data.chatId).emit('call-ended', {
-        from: socket.userId
+      const { chatId } = data;
+      socket.to(chatId).emit('call-ended', {
+        chatId,
+        ender: socket.user
       });
     });
 
-    // Marcar mensagens como lidas
-    socket.on('mark-as-read', async (data) => {
+    socket.on('ice-candidate', (data) => {
+      const { chatId, candidate } = data;
+      socket.to(chatId).emit('ice-candidate', {
+        chatId,
+        candidate,
+        sender: socket.user
+      });
+    });
+
+    // Status de usuário (online/offline/digitando)
+    socket.on('update-status', async (data) => {
       try {
-        const { messageIds, chatId } = data;
-
-        const readReceipts = messageIds.map(messageId => ({
-          message_id: messageId,
-          user_id: socket.userId,
-          read_at: new Date().toISOString()
-        }));
-
-        await supabase
-          .from('message_read_receipts')
-          .upsert(readReceipts);
-
-        socket.to(chatId).emit('messages-read', {
+        const { status } = data;
+        
+        await FirestoreUser.update(socket.userId, { status });
+        
+        // Notificar contatos sobre mudança de status
+        socket.broadcast.emit('user-status-updated', {
           userId: socket.userId,
-          messageIds,
-          readAt: new Date().toISOString()
+          status
         });
-
       } catch (error) {
-        socket.emit('error', { message: 'Erro ao marcar mensagens como lidas' });
+        console.error('Erro ao atualizar status:', error);
       }
     });
 
     // Desconexão
     socket.on('disconnect', async () => {
-      console.log(`👋 Usuário desconectado: ${socket.user.name}`);
+      console.log(`👋 Usuário desconectado: ${socket.user.name} (${socket.userId})`);
 
-      // Atualizar status offline
-      await supabase
-        .from('users')
-        .update({ 
-          is_online: false, 
-          last_seen: new Date().toISOString() 
-        })
-        .eq('id', socket.userId);
+      try {
+        // Atualizar status offline
+        await FirestoreUser.updateOnlineStatus(socket.userId, false);
 
-      // Notificar que usuário ficou offline
-      socket.broadcast.emit('user-offline', {
-        userId: socket.userId,
-        lastSeen: new Date().toISOString()
-      });
+        // Notificar contatos sobre status offline
+        socket.broadcast.emit('user-offline', {
+          userId: socket.userId,
+          lastSeen: new Date()
+        });
+      } catch (error) {
+        console.error('Erro ao atualizar status offline:', error);
+      }
     });
   });
 };
+
