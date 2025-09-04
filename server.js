@@ -47,3 +47,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`🔥 Firebase Firestore configurado`);
 });
 
+
+
+// Servir arquivos estáticos do frontend para o cliente de teste
+app.use("/test", express.static("../frontend"));
