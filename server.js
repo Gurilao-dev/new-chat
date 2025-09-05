@@ -68,3 +68,10 @@ server.listen(PORT, '0.0.0.0', () => {
 app.use('/test', express.static('../frontend'));
 
 module.exports = { db, admin };
+
+
+app.get("/api/health", (req, res) => {
+  res.status(200).json({ status: "OK", message: "Backend is healthy" });
+});
+
+
